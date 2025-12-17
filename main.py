@@ -8,17 +8,15 @@ import networkx as nx
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
-# Config das Constantes
+# --- CONSTANTES ---
 MAX_RECURSOS = 10
 MAX_PROCESSOS = 10
 
-# Uma Lock global tentando garantir integridade de dados compartilhados
+# Global Lock para integridade
 global_lock = threading.RLock()
 
+
 class Logger:
-    """
-    Simulação do terminal na GUI
-    """
     def __init__(self, text_widget):
         self.widget = text_widget
 
@@ -41,11 +39,12 @@ class Recurso:
         self.id = r_id
         self.nome = nome
         self.dono = None
-        # Condition Variable Permite dormir esperando este recurso específico
+        # Condition Variable para espera
         self.condicao = threading.Condition(global_lock)
 
     def __repr__(self):
-        return f"Recurso({self.id}, {self.nome})"
+        return f"{self.nome}({self.id})"
+
 
 class Processo(threading.Thread):
     def __init__(self, p_id, delta_ts, delta_tu, recursos_sistema, logger):
@@ -56,6 +55,7 @@ class Processo(threading.Thread):
         self.recursos_sistema = recursos_sistema
         self.logger = logger
 
+        # Lista simples de recursos (não precisa mais da tupla de tempo)
         self.recursos_posse = []
         self.recurso_aguardando = None
 
@@ -64,55 +64,77 @@ class Processo(threading.Thread):
 
     def run(self):
         while self.running:
-            # Intervalo de solicitação
+            # 1. Aguarda intervalo de solicitação (Isso não trava mais a devolução de recursos)
             time.sleep(self.delta_ts)
 
-            # Identifica recursos que o processo AINDA NÃO TEM
+            # 2. Verifica quais recursos ainda não tem
             with global_lock:
-                disponiveis_para_pedir = [r for r in self.recursos_sistema if r not in self.recursos_posse]
+                disponiveis_para_pedir = [r for r in self.recursos_sistema
+                                          if r not in self.recursos_posse]
 
             if not disponiveis_para_pedir:
                 continue
 
-            # --- SELEÇÃO ALEATÓRIA  ---
-            recurso_desejado = random.choice(disponiveis_para_pedir) #
-
+            # 3. Escolhe e Solicita
+            recurso_desejado = random.choice(disponiveis_para_pedir)
             self.solicitar_recurso(recurso_desejado)
+
+            # OBS: Não existe mais chamada manual de liberação aqui.
+            # O Timer cuida disso sozinho em background.
 
     def solicitar_recurso(self, recurso):
         self.logger.log(f"Processo {self.p_id} SOLICITOU {recurso.nome}.")
 
         with global_lock:
-            # Se o recurso tem dono, bloqueia (dorme)
+            # Se ocupado, dorme
             while recurso.dono is not None:
                 self.recurso_aguardando = recurso
-                self.logger.log(f"Processo {self.p_id} BLOQUEADO por {recurso.nome} (Dono: P{recurso.dono.p_id}).")
+                self.logger.log(
+                    f"Processo {self.p_id} BLOQUEADO aguardando {recurso.nome} (Dono: P{recurso.dono.p_id}).")
 
-                # wait() libera o lock e dorme
+                # A thread trava aqui, MAS os timers de outros recursos continuam rodando!
                 recurso.condicao.wait()
 
-            # Recurso livre: toma posse
+                # Conseguiu
             recurso.dono = self
             self.recurso_aguardando = None
             self.recursos_posse.append(recurso)
             self.logger.log(f"Processo {self.p_id} PEGOU {recurso.nome}.")
 
-        # --- UTILIZAÇÃO ASSÍNCRONA ---
-        # Agenda a liberação para o futuro sem travar a thread.
-        timer = threading.Timer(self.delta_tu, self.liberar_recurso_agendado, args=[recurso])
-        timer.daemon = True
-        timer.start()
+        # --- CORREÇÃO: USO DE TIMER ASSÍNCRONO ---
+        # Inicia uma thread separada que vai contar o tempo Delta TU
+        # e chamar 'liberar_recurso_assincrono' quando acabar.
+        t = threading.Timer(self.delta_tu, self.liberar_recurso_assincrono, args=[recurso])
+        t.daemon = True  # Mata o timer se o programa fechar
+        t.start()
 
-    def liberar_recurso_agendado(self, recurso):
-        # Libera após Delta Tu
+    def liberar_recurso_assincrono(self, recurso):
+        """
+        Esta função é chamada pelo Timer.
+        Agora ela respeita o bloqueio do processo.
+        """
         with global_lock:
-            if recurso in self.recursos_posse:
-                recurso.dono = None
-                self.recursos_posse.remove(recurso)
-                self.logger.log(f"Processo {self.p_id} LIBEROU {recurso.nome}.")
+            # --- A MUDANÇA ESTÁ AQUI ---
+            # Se 'recurso_aguardando' não for None, significa que o processo
+            # está dormindo no 'wait()' dentro de 'solicitar_recurso'.
+            # Se ele está travado, ele não terminou o trabalho, então NÃO DEVE soltar o recurso.
+            if self.recurso_aguardando is not None:
+                # Opcional: Logar que o tempo acabou mas ele não vai soltar
+                # self.logger.log(f"P{self.p_id}: Tempo de {recurso.nome} acabou, mas segurou (Hold and Wait).")
 
-                # Acorda processos esperando este recurso
+                # Se quisermos ser muito rigorosos, poderíamos reiniciar o timer aqui,
+                # mas apenas 'return' já garante que o deadlock seja eterno.
+                return
+
+                # Se chegou aqui, o processo está livre (trabalhando), então pode liberar.
+            if recurso in self.recursos_posse:
+                self.recursos_posse.remove(recurso)
+                recurso.dono = None
+                self.logger.log(f"Processo {self.p_id} LIBEROU {recurso.nome} (Timer acabou).")
+
+                # Acorda quem estava dormindo esperando esse recurso
                 recurso.condicao.notify_all()
+
 
 class SistemaOperacional(threading.Thread):
     def __init__(self, intervalo_check, processos, recursos, callback_atualizacao_gui):
@@ -131,7 +153,6 @@ class SistemaOperacional(threading.Thread):
             self.callback(deadlock_info)
 
     def detectar_deadlock(self):
-        # Detectar deadlocks utilizando grafos
         G = nx.DiGraph()
 
         with global_lock:
@@ -140,15 +161,16 @@ class SistemaOperacional(threading.Thread):
             for r in self.recursos:
                 G.add_node(f"R{r.id}", type='recurso')
 
+            # Arestas de Alocação
             for r in self.recursos:
                 if r.dono:
-                    G.add_edge(f"R{r.id}", f"P{r.dono.p_id}")  # Recurso -> Processo
+                    G.add_edge(f"R{r.id}", f"P{r.dono.p_id}")
 
+            # Arestas de Solicitação
             for p in self.processos:
                 if p.recurso_aguardando:
-                    G.add_edge(f"P{p.p_id}", f"R{p.recurso_aguardando.id}")  # Processo -> Recurso
+                    G.add_edge(f"P{p.p_id}", f"R{p.recurso_aguardando.id}")
 
-        # Detecta ciclos
         try:
             cycles = list(nx.simple_cycles(G))
         except:
@@ -158,7 +180,6 @@ class SistemaOperacional(threading.Thread):
         for cycle in cycles:
             for node in cycle:
                 if node.startswith("P"):
-                    # Coletando processos no ciclo
                     in_deadlock.add(node)
 
         return {
@@ -180,19 +201,15 @@ class App(tk.Tk):
         self.processos = []
         self.so_thread = None
         self.temp_process_configs = []
-
         self.setup_ui()
 
     def setup_ui(self):
         self.tab_control = ttk.Notebook(self)
-
         self.tab_config = ttk.Frame(self.tab_control)
         self.tab_sim = ttk.Frame(self.tab_control)
-
         self.tab_control.add(self.tab_config, text='Configuração')
         self.tab_control.add(self.tab_sim, text='Simulação')
         self.tab_control.pack(expand=1, fill="both")
-
         self.build_config_tab()
         self.build_sim_tab()
 
@@ -200,18 +217,15 @@ class App(tk.Tk):
         frame = ttk.LabelFrame(self.tab_config, text="Configuração Inicial")
         frame.pack(padx=10, pady=10, fill="both", expand=True)
 
-        # Recursos
         lbl_res = ttk.Label(frame, text="Adicionar Recurso (Nome):")
         lbl_res.grid(row=0, column=0, padx=5, pady=5)
         self.entry_res_nome = ttk.Entry(frame)
         self.entry_res_nome.grid(row=0, column=1, padx=5, pady=5)
         btn_add_res = ttk.Button(frame, text="Adicionar Recurso", command=self.add_recurso)
         btn_add_res.grid(row=0, column=2, padx=5, pady=5)
-
         self.listbox_res = tk.Listbox(frame, height=6)
         self.listbox_res.grid(row=1, column=0, columnspan=3, padx=5, pady=5, sticky="ew")
 
-        # SO
         lbl_so = ttk.Label(frame, text="Intervalo SO (Δt seg):")
         lbl_so.grid(row=2, column=0, padx=5, pady=5)
         self.entry_so_time = ttk.Entry(frame)
@@ -220,25 +234,21 @@ class App(tk.Tk):
 
         ttk.Separator(frame, orient='horizontal').grid(row=3, column=0, columnspan=3, pady=10, sticky="ew")
 
-        # Processos
         lbl_proc_desc = ttk.Label(frame, text="Processos:")
         lbl_proc_desc.grid(row=4, column=0, columnspan=3)
-
         lbl_ts = ttk.Label(frame, text="ΔTs (Solicitação):")
         lbl_ts.grid(row=5, column=0)
         self.entry_ts = ttk.Entry(frame, width=10)
         self.entry_ts.insert(0, "0.5")
         self.entry_ts.grid(row=5, column=1)
-
         lbl_tu = ttk.Label(frame, text="ΔTu (Utilização):")
         lbl_tu.grid(row=6, column=0)
         self.entry_tu = ttk.Entry(frame, width=10)
-        self.entry_tu.insert(0, "50.0")
+        self.entry_tu.insert(0, "5.0")
         self.entry_tu.grid(row=6, column=1)
 
         btn_add_proc = ttk.Button(frame, text="Adicionar Processo à Fila", command=self.add_processo_config)
         btn_add_proc.grid(row=7, column=0, columnspan=3, pady=5)
-
         self.listbox_proc = tk.Listbox(frame, height=6)
         self.listbox_proc.grid(row=8, column=0, columnspan=3, padx=5, pady=5, sticky="ew")
 
@@ -248,7 +258,6 @@ class App(tk.Tk):
     def build_sim_tab(self):
         self.frame_graph = ttk.Frame(self.tab_sim)
         self.frame_graph.pack(side="left", fill="both", expand=True)
-
         self.frame_info = ttk.Frame(self.tab_sim, width=400)
         self.frame_info.pack(side="right", fill="y")
 
@@ -329,7 +338,6 @@ class App(tk.Tk):
 
         self.ax.clear()
         pos = nx.circular_layout(G) if len(G.nodes) > 0 else {}
-
         color_map = []
         for node in G.nodes():
             if node in in_deadlock or any(node in c for c in cycles):
@@ -349,12 +357,12 @@ class App(tk.Tk):
             state = "RODANDO"
             if p.recurso_aguardando: state = "BLOQUEADO"
 
-            held = [r.nome for r in p.recursos_posse]
+            held_names = [r.nome for r in p.recursos_posse]
+
             p_name = f"P{p.p_id}"
             deadlock_mark = " [DEADLOCK]" if p_name in in_deadlock else ""
-
             status_msg += f"{p_name}{deadlock_mark}: {state}\n"
-            status_msg += f"   Posse: {held}\n"
+            status_msg += f"   Posse: {held_names}\n"
             if p.recurso_aguardando:
                 status_msg += f"   Esperando: {p.recurso_aguardando.nome}\n"
             status_msg += "\n"
