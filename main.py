@@ -55,7 +55,7 @@ class Processo(threading.Thread):
         self.recursos_sistema = recursos_sistema
         self.logger = logger
 
-        # Lista simples de recursos (não precisa mais da tupla de tempo)
+        # Lista de recurso
         self.recursos_posse = []
         self.recurso_aguardando = None
 
@@ -79,20 +79,20 @@ class Processo(threading.Thread):
             recurso_desejado = random.choice(disponiveis_para_pedir)
             self.solicitar_recurso(recurso_desejado)
 
-            # OBS: Não existe mais chamada manual de liberação aqui.
-            # O Timer cuida disso sozinho em background.
+
+            # O Timer está responsável liberação.
 
     def solicitar_recurso(self, recurso):
         self.logger.log(f"Processo {self.p_id} SOLICITOU {recurso.nome}.")
 
         with global_lock:
-            # Se ocupado, dorme
+            # Se ocupado, dorme VAI ACORDAR UMA VEZ QUE O OUTRO SAIR DA REGIÃO CRÍTICA
             while recurso.dono is not None:
                 self.recurso_aguardando = recurso
                 self.logger.log(
                     f"Processo {self.p_id} BLOQUEADO aguardando {recurso.nome} (Dono: P{recurso.dono.p_id}).")
 
-                # A thread trava aqui, MAS os timers de outros recursos continuam rodando!
+                # A thread trava aqui SOLICITANDO, MAS os timers de outros recursos continuam rodando!
                 recurso.condicao.wait()
 
                 # Conseguiu
@@ -101,11 +101,11 @@ class Processo(threading.Thread):
             self.recursos_posse.append(recurso)
             self.logger.log(f"Processo {self.p_id} PEGOU {recurso.nome}.")
 
-        # --- CORREÇÃO: USO DE TIMER ASSÍNCRONO ---
+        # --- USO DE TIMER ASSÍNCRONO ---
         # Inicia uma thread separada que vai contar o tempo Delta TU
-        # e chamar 'liberar_recurso_assincrono' quando acabar.
+        # e chamar 'liberar_recurso_assincrono' quando acabar SO LIBERA SE NÃO ESTIVER ESPERANDO.
         t = threading.Timer(self.delta_tu, self.liberar_recurso_assincrono, args=[recurso])
-        t.daemon = True  # Mata o timer se o programa fechar
+        t.daemon = True
         t.start()
 
     def liberar_recurso_assincrono(self, recurso):
@@ -114,15 +114,14 @@ class Processo(threading.Thread):
         Agora ela respeita o bloqueio do processo.
         """
         with global_lock:
-            # --- A MUDANÇA ESTÁ AQUI ---
             # Se 'recurso_aguardando' não for None, significa que o processo
             # está dormindo no 'wait()' dentro de 'solicitar_recurso'.
             # Se ele está travado, ele não terminou o trabalho, então NÃO DEVE soltar o recurso.
             if self.recurso_aguardando is not None:
                 # Opcional: Logar que o tempo acabou mas ele não vai soltar
                 # self.logger.log(f"P{self.p_id}: Tempo de {recurso.nome} acabou, mas segurou (Hold and Wait).")
-
-                # Se quisermos ser muito rigorosos, poderíamos reiniciar o timer aqui,
+                # !!!!! É isso que faz com que o processo prenda o recurso mesmo tendo acabado o tempo
+                # poderíamos reiniciar o timer aqui,
                 # mas apenas 'return' já garante que o deadlock seja eterno.
                 return
 
